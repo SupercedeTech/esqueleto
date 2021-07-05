@@ -2467,8 +2467,90 @@ rawSelectSource mode query = do
             Just (Left err) -> liftIO $ throwIO $ PersistMarshalError err
             Nothing         -> return ()
 
+-- | (Internal) Execute an @esqueleto@ @SELECT@ 'SqlQuery' inside
+-- @persistent@'s 'SqlPersistT' monad via a PostgreSQL cursor.
+rawSelectSource
+    ::
+    ( SqlSelect a r
+    , MonadIO m1
+    , MonadIO m2
+    )
+    => Mode
+    -> SqlQuery a
+    -> SqlReadT m1 (Acquire (C.ConduitT () r m2 ()))
+rawSelectSource mode query = do
+    conn <- projectBackend <$> R.ask
+    let _ = conn :: SqlBackend
+    res <- R.withReaderT (const conn) (run conn)
+    return $ (C..| massage) `fmap` res
+  where
+    run conn =
+        uncurry rawQueryRes $
+        first builderToText $
+        toRawSql mode (conn, initialIdentState) query
+
+    massage = do
+        mrow <- C.await
+        case sqlSelectProcessRow <$> mrow of
+            Just (Right r)  -> C.yield r >> massage
+            Just (Left err) -> liftIO $ throwIO $ PersistMarshalError err
+            Nothing         -> return ()
+
+-- | (Internal) Execute an @esqueleto@ @SELECT@ 'SqlQuery' inside
+-- @persistent@'s 'SqlPersistT' monad via a PostgreSQL cursor.
+rawSelectCursorSource
+    ::
+    ( SqlSelect a r
+    , MonadIO m1
+    , MonadIO m2
+    )
+    => Mode
+    -> SqlQuery a
+    -> SqlReadT m1 (Acquire (C.ConduitT () r m2 ()))
+rawSelectCursorSource mode query = do
+    conn <- projectBackend <$> R.ask
+    let _ = conn :: SqlBackend
+    res <- R.withReaderT (const conn) (run conn)
+    return $ (C..| massage) `fmap` res
+  where
+    run conn =
+        uncurry rawQueryResFromCursor $
+        first builderToText $
+        toRawSql mode (conn, initialIdentState) query
+
+    massage = do
+        mrow <- C.await
+        case sqlSelectProcessRow <$> mrow of
+            Just (Right r)  -> C.yield r >> massage
+            Just (Left err) -> liftIO $ throwIO $ PersistMarshalError err
+            Nothing         -> return ()
+
+-- | Execute an @esqueleto@ @SELECT@ query inside @persistent@'s 'SqlPersistT'
+-- monad and return a 'C.Source' of rows. The source uses a PostgreSQL cursor to
+-- stream the results in constant memory, unlike 'selectSource' which requests
+-- the query's entire results.
+selectCursorSource ::
+    ( SqlSelect a r
+    , BackendCompatible SqlBackend backend
+    , IsPersistBackend backend
+    , PersistQueryRead backend
+    , PersistStoreRead backend, PersistUniqueRead backend
+    , MonadResource m
+    )
+    => SqlQuery a
+    -> C.ConduitT () r (R.ReaderT backend m) ()
+selectCursorSource query = do
+    res <- lift $ rawSelectCursorSource SELECT query
+    (key, src) <- lift $ allocateAcquire res
+    src
+    lift $ release key
+
 -- | Execute an @esqueleto@ @SELECT@ query inside @persistent@'s
 -- 'SqlPersistT' monad and return a 'C.Source' of rows.
+--
+-- Warning: Even though this function returns a conduit source, the underlying
+-- results from the PostgreSQL C API are still loaded into memory all at
+-- once. Compare with 'selectSourceConstantMemory'.
 selectSource
     ::
     ( SqlSelect a r
