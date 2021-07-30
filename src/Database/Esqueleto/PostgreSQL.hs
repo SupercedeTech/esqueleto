@@ -4,6 +4,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE Rank2Types #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 
 -- | This module contain PostgreSQL-specific functions.
 --
@@ -26,6 +28,7 @@ module Database.Esqueleto.PostgreSQL
     , insertSelectWithConflict
     , insertSelectWithConflictCount
     , filterWhere
+    , values
     -- * Internal
     , unsafeSqlAggregateFunction
     ) where
@@ -38,12 +41,17 @@ import Control.Exception (throw)
 import Control.Monad (void)
 import Control.Monad.IO.Class (MonadIO(..))
 import qualified Control.Monad.Trans.Reader as R
+import qualified Data.Text.Lazy as TL
 import Data.Int (Int64)
+import Data.Maybe (fromMaybe)
+import qualified Data.List.NonEmpty as NE
 import Data.Proxy (Proxy(..))
 import qualified Data.Text.Internal.Builder as TLB
 import Data.Time.Clock (UTCTime)
 import Database.Esqueleto.Internal.Internal hiding (random_)
 import Database.Esqueleto.Internal.PersistentImport hiding (upsert, upsertBy)
+import qualified Database.Esqueleto.Experimental.From as Ex
+import qualified Database.Esqueleto.Experimental as Ex
 import Database.Persist.Class (OnlyOneUniqueKey)
 import Database.Persist (ConstraintNameDB(..), EntityNameDB(..))
 import Database.Persist.SqlBackend
@@ -363,3 +371,61 @@ filterWhere aggExpr clauseExpr = ERaw noMeta $ \_ info ->
     in ( aggBuilder <> " FILTER (WHERE " <> clauseBuilder <> ")"
        , aggValues <> clauseValues
        )
+
+
+newtype PgValuesExprs a = PgValuesExprs { unPgValuesExprs :: NE.NonEmpty (SqlExpr (Value a)) }
+
+instance Ex.ToFrom (PgValuesExprs a) (SqlExpr (Value a)) where
+  toFrom (PgValuesExprs vs) = fromValues vs
+
+fromValues :: NE.NonEmpty (SqlExpr (Value a)) -> Ex.From (SqlExpr (Value a))
+fromValues exprs = Ex.From $ do
+  ident <- newIdentFor $ DBName "vq"
+  let frst = NE.head exprs
+  alias@(ERaw aliasMeta _) <- Ex.toAlias frst
+  ref <- Ex.toAliasReference ident alias
+  let aliasIdent = fromMaybe ident $ sqlExprMetaAlias aliasMeta
+  pure (ref, const $ mkExpr ident aliasIdent)
+  where
+    mkExpr ident aliasIdent info =
+      let materializedExprs = materializeExpr info <$> NE.toList exprs
+          params   = map snd materializedExprs
+          exprsSql = map fst materializedExprs
+          valsSql = TL.intercalate ", "
+            $ map (\e -> "(" <> e <> ")")
+            $ map TLB.toLazyText exprsSql
+      in
+        ( "(VALUES " <> TLB.fromLazyText valsSql <> ") AS "
+        <> useIdent info ident
+        <> "(" <> useIdent info aliasIdent <> ")"
+        , concat params
+        )
+
+-- | Allows to use `VALUES (..)` in-memory set of values
+-- in RHS of `from` expressions. Useful for JOIN's on
+-- known values which also can be additionally preprocessed
+-- somehow on db side with usage of inner PostgreSQL capabilities.
+-- 
+-- Currently supports only single-column expressions.
+--
+-- Example of usage:
+--
+-- share [mkPersist sqlSettings] [persistLowerCase|
+--   User
+--     name Text
+--     age Int
+--     deriving Eq Show
+--
+-- select $ do
+--  bound :& user <- from $
+--      values $ val 10 :| [val 20, val 30, val 40]
+--      `InnerJoin` table User
+--      `on` (\(bound :& user) -> user^.UserAge >=. bound)
+--  groupBy bound
+--  pure (bound, count $ user^.UserName)
+-- 
+-- @
+-- 
+-- @since 3.5.2.2
+values :: NE.NonEmpty (SqlExpr (Value a)) -> PgValuesExprs a
+values = PgValuesExprs

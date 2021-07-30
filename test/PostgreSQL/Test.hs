@@ -25,6 +25,7 @@ import qualified Data.Char as Char
 import Data.Coerce
 import Data.Foldable
 import qualified Data.List as L
+import qualified Data.List.NonEmpty as NE
 import Data.Map (Map)
 import qualified Data.Map.Strict as Map
 import Data.Ord (comparing)
@@ -1264,6 +1265,17 @@ testLateralQuery = do
             let _ = res :: [(Entity Lord, Value (Maybe Int))]
             asserting noExceptions
 
+testValuesExpression :: SpecDb
+testValuesExpression = do
+  describe "(VALUES (..)) query" $ do
+    itDb "supports simple one-column SELECT query" $ do
+      result <- select $ do
+          v <- Experimental.from $ EP.values $ val 1 NE.:| [val 2, val 3, val 4 ]
+          pure (v :: SqlExpr (Value Int))
+
+      asserting noExceptions
+      liftIO $ result `shouldBe` [Value 1, Value 2, Value 3, Value 4]
+
 type JSONValue = Maybe (JSONB A.Value)
 
 createSaneSQL :: (PersistField a, MonadIO m) => SqlExpr (Value a) -> T.Text -> [PersistValue] -> SqlPersistT m ()
@@ -1356,6 +1368,7 @@ spec = beforeAll mkConnectionPool $ do
                 testJSONInsertions
                 testJSONOperators
         testLateralQuery
+        testValuesExpression
 
 insertJsonValues :: SqlPersistT IO ()
 insertJsonValues = do
